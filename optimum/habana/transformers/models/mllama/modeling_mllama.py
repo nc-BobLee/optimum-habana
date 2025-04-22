@@ -2,7 +2,7 @@
 # Copyright 2024 the HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
+# You may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 """PyTorch Mllama model."""
 
 import math
@@ -25,8 +26,15 @@ import torch.utils.checkpoint
 from torch import nn
 from transformers.cache_utils import Cache
 from transformers.modeling_attn_mask_utils import AttentionMaskConverter
-from transformers.modeling_outputs import BaseModelOutput, BaseModelOutputWithPast, CausalLMOutputWithPast
-from transformers.models.mllama.configuration_mllama import MllamaConfig, MllamaTextConfig
+from transformers.modeling_outputs import (
+    BaseModelOutput,
+    BaseModelOutputWithPast,
+    CausalLMOutputWithPast,
+)
+from transformers.models.mllama.configuration_mllama import (
+    MllamaConfig,
+    MllamaTextConfig,
+)
 from transformers.models.mllama.modeling_mllama import (
     MllamaCrossAttentionDecoderLayer,
     MllamaForCausalLM,
@@ -34,6 +42,7 @@ from transformers.models.mllama.modeling_mllama import (
     MllamaSelfAttentionDecoderLayer,
     MllamaTextCrossAttention,
     MllamaTextModel,
+    MllamaTextRMSNorm,
     MllamaTextSelfAttention,
     MllamaVisionAttention,
     MllamaVisionConfig,
@@ -44,13 +53,16 @@ from transformers.models.mllama.modeling_mllama import (
     apply_rotary_pos_emb,
     repeat_kv,
 )
-from transformers.utils import (
-    logging,
-)
+from transformers.utils import logging
 
-from ...modeling_attn_mask_utils import (
-    _gaudi_prepare_4d_causal_attention_mask,
-)
+from ...modeling_attn_mask_utils import _gaudi_prepare_4d_causal_attention_mask
+
+
+try:
+    from habana_frameworks.torch.hpex.normalization import FusedRMSNorm as FusedRMSNorm
+except ImportError:
+    print("Not using HPU fused kernel for RMSNorm")
+    FusedRMSNorm = None
 
 
 logger = logging.get_logger(__name__)
@@ -60,6 +72,32 @@ try:
 except ImportError:
     print("Not using HPU fused scaled dot-product attention kernel.")
     FusedSDPA = None
+
+
+class GaudiMllamaTextRMSNorm(MllamaTextRMSNorm):
+    def __init__(self, hidden_size, eps=1e-6):
+        """
+        MllamaTextRMSNorm is equivalent to T5LayerNorm
+        """
+        super().__init__(hidden_size, eps)
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+
+    def forward(self, hidden_states):
+        """Copied from MllamaTextRMSNorm::forward https://github.com/huggingface/transformers/blob/53fad641cfdb5105e2470bcf3ef17ea8e25cc300/src/transformers/models/mllama/modeling_mllama.py#L475. The only differences are:
+        - Using FusedRMSNorm"""
+        orig_dtype = hidden_states.dtype
+        if FusedRMSNorm is not None:
+            hidden_states = FusedRMSNorm.apply(hidden_states.float(), self.weight.float(), self.variance_epsilon)
+            return hidden_states.to(orig_dtype)
+        else:
+            hidden_states = hidden_states.to(torch.float32)
+            variance = hidden_states.pow(2).mean(-1, keepdim=True)
+            hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+            return self.weight * hidden_states.to(orig_dtype)
+
+    def extra_repr(self):
+        return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
 
 
 class ModuleFusedSDPA(torch.nn.Module):
@@ -477,6 +515,7 @@ class GaudiMllamaSelfAttentionDecoderLayer(MllamaSelfAttentionDecoderLayer):
     def __init__(self, config: MllamaTextConfig, layer_idx: int) -> None:
         super(GaudiMllamaSelfAttentionDecoderLayer, self).__init__(config, layer_idx)
         self.self_attn = GaudiMllamaTextSelfAttention(config, layer_idx=layer_idx)
+        self.input_layernorm = GaudiMllamaTextRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -869,6 +908,7 @@ class GaudiMllamaForCausalLM(MllamaForCausalLM):
         token_idx: Optional[torch.Tensor] = None,
         use_flash_attention: Optional[bool] = False,
         flash_attention_recompute: Optional[bool] = False,
+        logits_bf16: Optional[bool] = False,
         **loss_kwargs,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         """
@@ -908,9 +948,12 @@ class GaudiMllamaForCausalLM(MllamaForCausalLM):
 
         if token_idx is None and logits_to_keep != 0:
             slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-            logits = self.lm_head(hidden_states[:, slice_indices, :]).float()
+            logits = self.lm_head(hidden_states[:, slice_indices, :])
         else:
-            logits = self.lm_head(hidden_states).float()
+            logits = self.lm_head(hidden_states)
+
+        if not logits_bf16:
+            logits = logits.float()
 
         loss = None
         if labels is not None:
@@ -957,6 +1000,7 @@ class GaudiMllamaForConditionalGeneration(MllamaForConditionalGeneration):
         token_idx: Optional[torch.Tensor] = None,
         use_flash_attention: Optional[bool] = False,
         flash_attention_recompute: Optional[bool] = False,
+        logits_bf16: Optional[bool] = False,
         **kwargs,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         """
@@ -1042,6 +1086,7 @@ class GaudiMllamaForConditionalGeneration(MllamaForConditionalGeneration):
             token_idx=token_idx,
             use_flash_attention=use_flash_attention,
             flash_attention_recompute=flash_attention_recompute,
+            logits_bf16=logits_bf16,
         )
 
         return outputs
@@ -1123,6 +1168,7 @@ class GaudiMllamaForConditionalGeneration(MllamaForConditionalGeneration):
                 "token_idx": token_idx,
                 "use_flash_attention": kwargs.get("use_flash_attention"),
                 "flash_attention_recompute": kwargs.get("flash_attention_recompute"),
+                "logits_bf16": kwargs.get("logits_bf16"),
             }
         )
 
